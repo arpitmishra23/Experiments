@@ -8,7 +8,7 @@
 #include <string.h>
 #include <omp.h>
 
-// Array length: 200 million elements (~1.6 GiB per array of doubles)
+// Array length: 50 million elements (~381.5 MiB per array of doubles)
 #define SIZE 50000000
 
 int main() {
