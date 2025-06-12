@@ -1,30 +1,24 @@
 /*
- * vm_cache_partition_monitor.c
+ * cos.c
  *
- * For two given VM UUIDs, this program:
- *  1) Reads the full‐LLC CBM mask from /sys/fs/resctrl/info/L3/cbm_mask.
- *  2) Splits that mask into two equal‐share masks.
- *  3) (Modified here) Builds a schemata that gives socket 0 → 0x0 (no ways),
- *       and socket 1 → half‐mask or its complement.
- *  4) Creates (or reuses) /sys/fs/resctrl/COS1 and COS2, writing these schemata.
- *  5) Finds each VM’s QEMU PID by grepping “ps -ef … -uuid <VM> … guest=<VM>” (fallback if needed).
- *  6) Appends each PID into COS1/tasks (VM1) and COS2/tasks (VM2).
- *  7) Phase 1: monitors each PID separately (two groups of one) for ‘duration’ seconds,
- *       saving to:
- *         • VM1_half_baseline.txt
- *         • VM2_half_baseline.txt
- *  8) Cleans up COS1/COS2, returns PIDs to default (full LLC), re‐initializes PQoS.
- *  9) Phase 2: monitors each PID separately for ‘duration’ seconds,
- *       saving to:
- *         • VM1_normal.txt
- *         • VM2_normal.txt
  *
- * Usage:
- *   sudo ./vm_cache_partition_monitor <VM1_UUID> <VM2_UUID> <duration_seconds>
+ *  1) Read the full L3 CBM mask from /sys/fs/resctrl/info/L3/cbm_mask (e.g. "7fff").
+ *  2) Split its set‐bits into two halves (lower half vs. upper half).
+ *  3) Write two schemata files:
+ *       /sys/fs/resctrl/COS1/schemata = 
+ *         MB:0=100;1=100
+ *         L2:0=ffff;...;83=ffff
+ *         L3:0=<full_mask>;1=<lower_half>
  *
- * Example:
- *   sudo ./vm_cache_partition_monitor f87b9c5a-bf69-4c13-8bc8-6bbf618c59a4 \
- *                                      1d8887d6-1c96-4722-b08d-603acd26f953 30
+ *       /sys/fs/resctrl/COS2/schemata = 
+ *         MB:0=100;1=100
+ *         L2:0=ffff;...;83=ffff
+ *         L3:0=<full_mask>;1=<upper_half>
+ *
+ *  4) Create the COS1 and COS2 directories if needed.
+ *  5) Assign VM1’s QEMU PID → COS1/tasks, VM2’s PID → COS2/tasks.
+ *  6) Monitor both PIDs for <duration> seconds (using the pqos API).
+ *
  */
 
 #define _GNU_SOURCE
@@ -48,16 +42,23 @@
 #define COS2_SCHEMATA       "/sys/fs/resctrl/COS2/schemata"
 #define COS1_TASKS          "/sys/fs/resctrl/COS1/tasks"
 #define COS2_TASKS          "/sys/fs/resctrl/COS2/tasks"
-#define DEFAULT_TASKS       "/sys/fs/resctrl/tasks"
 
+/*-----------------------------------------
+ * Print an error message and exit
+ *-----------------------------------------*/
 static void die(const char *fmt, ...) {
-    va_list ap; va_start(ap, fmt);
+    va_list ap;
+    va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
     fprintf(stderr, "\n");
     va_end(ap);
     exit(EXIT_FAILURE);
 }
 
+/*-----------------------------------------
+ * Read the first line of a file into a malloc’d, NUL‐terminated string.
+ * Caller must free() the returned buffer. Returns NULL on failure.
+ *-----------------------------------------*/
 static char *read_file(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) return NULL;
@@ -73,19 +74,43 @@ static char *read_file(const char *path) {
     return buf;
 }
 
-static int parse_hex_u64(const char *hexstr, uint64_t *out) {
+/*-----------------------------------------
+ * Parse a hex string (no “0x” prefix) into uint64_t.
+ * Returns 0 on success, -1 on error.
+ *-----------------------------------------*/
+static int parse_hex_no_prefix(const char *hexstr, uint64_t *out) {
     char *endp = NULL;
     errno = 0;
-    uint64_t val = strtoull(hexstr, &endp, 0);
+    uint64_t val = strtoull(hexstr, &endp, 16);
     if (errno != 0 || (endp && *endp != '\0')) return -1;
     *out = val;
     return 0;
 }
 
-/* We only care about socket IDs (0 or 1 in most dual‐socket boxes). */
+/*-----------------------------------------
+ * Count how many “1” bits are in a 64‐bit integer.
+ *-----------------------------------------*/
+static int count_bits(uint64_t x) {
+    int cnt = 0;
+    while (x) {
+        x &= (x - 1);
+        cnt++;
+    }
+    return cnt;
+}
+
+/*-----------------------------------------
+ * Detect how many sockets (physical_package_id) exist.
+ * We glob “/sys/devices/system/cpu/cpu*topology/physical_package_id”,
+ * read each file, collect unique IDs, sort them, return count.
+ * Returns 0 on success, -1 on failure.
+ * On success, *sockets_out is malloc’d array (sorted), *count_out is number of sockets.
+ * Caller must free(*sockets_out).
+ *-----------------------------------------*/
 static int detect_sockets(int **sockets_out, int *count_out) {
     glob_t gl;
-    if (glob("/sys/devices/system/cpu/cpu*/topology/physical_package_id", 0, NULL, &gl) != 0)
+    if (glob("/sys/devices/system/cpu/cpu*/topology/physical_package_id",
+             0, NULL, &gl) != 0)
         return -1;
     int *ids = calloc(gl.gl_pathc, sizeof(int));
     if (!ids) { globfree(&gl); return -1; }
@@ -102,7 +127,7 @@ static int detect_sockets(int **sockets_out, int *count_out) {
         if (!found) ids[n++] = pid;
     }
     globfree(&gl);
-    /* Sort the socket IDs (so 0 comes before 1). */
+    /* Sort ascending */
     for (int i = 0; i < n; i++) {
         for (int j = i + 1; j < n; j++) {
             if (ids[j] < ids[i]) {
@@ -115,13 +140,14 @@ static int detect_sockets(int **sockets_out, int *count_out) {
     return 0;
 }
 
-/* Split a full‐mask (e.g. 0x7fff) into two equal halves: mask1 gets lower bits, mask2 gets upper. */
+/*-----------------------------------------
+ * Split ‘full_mask’ into two halves:
+ *   - mask1 = lowest floor(total_bits/2) set bits
+ *   - mask2 = remaining set bits
+ *-----------------------------------------*/
 static void split_mask(uint64_t full_mask, uint64_t *mask1, uint64_t *mask2) {
-    int total_bits = 0;
-    for (int b = 0; b < 64; b++) {
-        if ((full_mask >> b) & 1ULL) total_bits++;
-    }
-    int half = total_bits / 2;
+    int total_bits = count_bits(full_mask);
+    int half = (total_bits )/ 2;  /* floor */
     uint64_t m1 = 0;
     int picked = 0;
     for (int b = 0; b < 64 && picked < half; b++) {
@@ -134,6 +160,9 @@ static void split_mask(uint64_t full_mask, uint64_t *mask1, uint64_t *mask2) {
     *mask2 = full_mask & ~m1;
 }
 
+/*-----------------------------------------
+ * mkdir -p: create a directory if missing (0755).
+ *-----------------------------------------*/
 static int mkdir_if_missing(const char *path) {
     struct stat st;
     if (stat(path, &st) == 0) {
@@ -145,6 +174,9 @@ static int mkdir_if_missing(const char *path) {
     return 0;
 }
 
+/*-----------------------------------------
+ * Write a NUL‐terminated string into a file (overwrite). Returns 0 on success.
+ *-----------------------------------------*/
 static int write_str_to_file(const char *path, const char *str) {
     FILE *f = fopen(path, "w");
     if (!f) return -1;
@@ -153,6 +185,9 @@ static int write_str_to_file(const char *path, const char *str) {
     return (wr == strlen(str)) ? 0 : -1;
 }
 
+/*-----------------------------------------
+ * Append a NUL‐terminated string + "\n" to a file. Returns 0 on success.
+ *-----------------------------------------*/
 static int append_str_to_file(const char *path, const char *str) {
     FILE *f = fopen(path, "a");
     if (!f) return -1;
@@ -162,10 +197,15 @@ static int append_str_to_file(const char *path, const char *str) {
     return (wr == strlen(str)) ? 0 : -1;
 }
 
+/*-----------------------------------------
+ * Find the QEMU‐KVM PID for a given VM UUID/name.
+ * Returns >0 on success, -1 on failure.
+ *-----------------------------------------*/
 static pid_t find_vm_pid(const char *vmname) {
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
-             "ps -ef | grep \"[q]emu-kvm.*-uuid.*%s.*-name.*guest=%s\" | awk '{print $2; exit}'",
+             "ps -ef | grep \"[q]emu-kvm.*-uuid.*%s.*-name.*guest=%s\" | "
+             "awk '{print $2; exit}'",
              vmname, vmname);
     FILE *p = popen(cmd, "r");
     if (!p) return -1;
@@ -186,6 +226,10 @@ static pid_t find_vm_pid(const char *vmname) {
     return (pid_t)atoi(line);
 }
 
+/*-----------------------------------------
+ * Wait up to timeout_sec for /proc/<pid> to exist.
+ * Returns 0 if pid appears, -1 otherwise.
+ *-----------------------------------------*/
 static int wait_for_pid(pid_t pid, int timeout_sec) {
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d", pid);
@@ -197,10 +241,9 @@ static int wait_for_pid(pid_t pid, int timeout_sec) {
     return -1;
 }
 
-/*
- * Monitor two PIDs as two single‐PID groups for 'duration' seconds,
- * writing VM1 to outfile1 and VM2 to outfile2.
- */
+/*-----------------------------------------
+ * Monitor two PIDs for ‘duration’ seconds, dump stats to two files.
+ *-----------------------------------------*/
 static void monitor_pids_pair(pid_t pid1, pid_t pid2,
                               int duration,
                               const char *outfile1,
@@ -285,11 +328,13 @@ static void monitor_pids_pair(pid_t pid1, pid_t pid2,
 
     pqos_mon_stop(&group0);
     pqos_mon_stop(&group1);
-
     fclose(f1);
     fclose(f2);
 }
 
+/*-----------------------------------------
+ * main()
+ *-----------------------------------------*/
 int main(int argc, char *argv[]) {
     if (argc != 4) {
         fprintf(stderr, "Usage: %s <VM1_UUID> <VM2_UUID> <duration_seconds>\n", argv[0]);
@@ -300,79 +345,107 @@ int main(int argc, char *argv[]) {
     int duration = atoi(argv[3]);
     if (duration <= 0) die("Invalid duration");
 
-    /* 1) Read full‐LLC CBM mask */
+    /* 1) Read the full CBM (e.g. "7fff") from sysfs. */
     char *cbm_raw = read_file(CBM_MASK_PATH);
     if (!cbm_raw)
         die("Cannot read %s: %s", CBM_MASK_PATH, strerror(errno));
 
-    uint64_t full_mask;
-    if (strncasecmp(cbm_raw, "0x", 2) != 0) {
-        char tmp[64];
-        snprintf(tmp, sizeof(tmp), "0x%s", cbm_raw);
-        if (parse_hex_u64(tmp, &full_mask) != 0)
-            die("Invalid CBM \"%s\"", cbm_raw);
-    } else {
-        if (parse_hex_u64(cbm_raw, &full_mask) != 0)
-            die("Invalid CBM \"%s\"", cbm_raw);
+    /* If it has a "0x" prefix, skip it. */
+    char *hex_no_prefix = cbm_raw;
+    if ((cbm_raw[0] == '0' && (cbm_raw[1] == 'x' || cbm_raw[1] == 'X'))) {
+        hex_no_prefix = cbm_raw + 2;
     }
-    free(cbm_raw);
-    printf("Full LLC CBM = 0x%016" PRIx64 "\n", full_mask);
+    size_t width = strlen(hex_no_prefix);
+    if (width == 0 || width > 16) die("Unexpected CBM \"%s\"", hex_no_prefix);
 
-    /* 2) Split mask into two halves */
-    uint64_t mask1, mask2;
-    split_mask(full_mask, &mask1, &mask2);
-    char mask1_str[32], mask2_str[32];
-    snprintf(mask1_str, sizeof(mask1_str), "0x%016" PRIx64, mask1);
-    snprintf(mask2_str, sizeof(mask2_str), "0x%016" PRIx64, mask2);
-    printf("Mask1 = %s, Mask2 = %s\n", mask1_str, mask2_str);
+    /* Parse that pure‐hex string into a uint64_t. */
+    uint64_t full_mask;
+    if (parse_hex_no_prefix(hex_no_prefix, &full_mask) != 0)
+        die("Invalid CBM \"%s\"", hex_no_prefix);
 
-    /* 3) Detect sockets (0 and 1) */
+    printf("Full LLC CBM = 0x%0*" PRIx64 "\n", (int)width, full_mask);
+
+    int total_ways = count_bits(full_mask);
+    if (total_ways == 0) die("Full mask has zero bits set—unexpected");
+
+    /* 2) Split those set bits into two halves (lower/upper). */
+    uint64_t mask_lower, mask_upper;
+    split_mask(full_mask, &mask_lower, &mask_upper);
+
+    /* 3) Convert each half back into zero‐padded hex of the same width. */
+    char plain_lower[32], plain_upper[32];
+    snprintf(plain_lower,  sizeof(plain_lower),  "%0*" PRIx64, (int)width, mask_lower);
+    snprintf(plain_upper,  sizeof(plain_upper),  "%0*" PRIx64, (int)width, mask_upper);
+
+    printf(" total ways   = %d\n", total_ways);
+    printf(" socket1 lower = 0x%s\n", plain_lower);
+    printf(" socket1 upper = 0x%s\n", plain_upper);
+
+    /* 4) Detect sockets (physical_package_id). */
     int *sockets = NULL, n_sockets = 0;
     if (detect_sockets(&sockets, &n_sockets) != 0 || n_sockets < 2)
         die("Failed to detect sockets or found fewer than 2 sockets");
-    /* We assume socket IDs are “0” and “1” (two‐socket system). */
     printf("Detected sockets:");
     for (int i = 0; i < n_sockets; i++) {
         printf(" %d", sockets[i]);
     }
     printf("\n");
 
-    /* 4) Create COS1/COS2 and write schemata so that:
-     *    • socket  0 → 0x0  (no ways allowed)
-     *    • socket  1 → mask1_str or mask2_str
-     *
-     *  i.e. VM1 only ever uses half of socket 1’s LLC, and none of socket 0’s.
-     */
+    int sock0 = sockets[0];   /* usually 0 */
+    int sock1 = sockets[1];   /* usually 1 */
+    free(sockets);
+
+    /* 5) Create /sys/fs/resctrl/COS1 and COS2 if they don’t exist. */
     if (mkdir_if_missing(COS1_DIR) != 0)
         die("mkdir %s: %s", COS1_DIR, strerror(errno));
     if (mkdir_if_missing(COS2_DIR) != 0)
         die("mkdir %s: %s", COS2_DIR, strerror(errno));
+     
+    /* 6) Initialize PQoS via OS‐Resctrl (control + monitor). */
+    struct pqos_config cfg = { .interface = PQOS_INTER_OS };
+    if (pqos_init(&cfg) != PQOS_RETVAL_OK)
+        die("pqos_init failed");
+    if (pqos_mon_reset() != PQOS_RETVAL_OK)
+        die("pqos_mon_reset failed");
+    /* Do NOT call pqos_mon_reset() again after writing schemata. */
 
-    /* We know sockets[] contains [0, 1] (after sorting). */
-    int sock0 = sockets[0];  // must be 0
-    int sock1 = sockets[1];  // must be 1
+    
 
-    char schem1[64], schem2[64];
-    snprintf(schem1, sizeof(schem1),
-             "L3:%d=0x0;L3:%d=%s",
-             sock0,    /* socket 0 → zero mask */
-             sock1,    /* socket 1 → half‐mask */
-             mask1_str);
-    snprintf(schem2, sizeof(schem2),
-             "L3:%d=0x0;L3:%d=%s",
-             sock0,    /* socket 0 → zero mask */
-             sock1,    /* socket 1 → other half */
-             mask2_str);
+    /* 7) Build exactly one “L3:” line with semicolon-separated pairs. */
+    char cos1_schema[1024];
+    snprintf(cos1_schema, sizeof(cos1_schema),
+             "MB:0=80;1=80\n"
+             "L2:0=ffff;1=ffff;2=ffff;3=ffff;4=ffff;5=ffff;6=ffff;7=ffff;"
+             "8=ffff;9=ffff;10=ffff;11=ffff;12=ffff;13=ffff;14=ffff;15=ffff;"
+             "16=ffff;17=ffff;18=ffff;19=ffff;64=ffff;65=ffff;66=ffff;67=ffff;"
+             "68=ffff;69=ffff;70=ffff;71=ffff;72=ffff;73=ffff;74=ffff;75=ffff;"
+             "76=ffff;77=ffff;78=ffff;79=ffff;80=ffff;81=ffff;82=ffff;83=ffff\n"
+             "L3:%d=%s;%d=%s\n",
+             sock0, plain_lower,
+             sock1, plain_lower);
 
-    if (write_str_to_file(COS1_SCHEMATA, schem1) != 0)
+    char cos2_schema[1024];
+    snprintf(cos2_schema, sizeof(cos2_schema),
+             "MB:0=20;1=20\n"
+             "L2:0=ffff;1=ffff;2=ffff;3=ffff;4=ffff;5=ffff;6=ffff;7=ffff;"
+             "8=ffff;9=ffff;10=ffff;11=ffff;12=ffff;13=ffff;14=ffff;15=ffff;"
+             "16=ffff;17=ffff;18=ffff;19=ffff;64=ffff;65=ffff;66=ffff;67=ffff;"
+             "68=ffff;69=ffff;70=ffff;71=ffff;72=ffff;73=ffff;74=ffff;75=ffff;"
+             "76=ffff;77=ffff;78=ffff;79=ffff;80=ffff;81=ffff;82=ffff;83=ffff\n"
+             "L3:%d=%s;%d=%s\n",
+             sock0, plain_upper,
+             sock1, plain_upper);
+
+    /* 8) Write those exact strings into COS1_SCHEMATA and COS2_SCHEMATA. */
+    if (write_str_to_file(COS1_SCHEMATA, cos1_schema) != 0)
         die("Writing %s: %s", COS1_SCHEMATA, strerror(errno));
-    if (write_str_to_file(COS2_SCHEMATA, schem2) != 0)
+    if (write_str_to_file(COS2_SCHEMATA, cos2_schema) != 0)
         die("Writing %s: %s", COS2_SCHEMATA, strerror(errno));
 
-    printf("Wrote schemata:\n  COS1: %s\n  COS2: %s\n", schem1, schem2);
-    free(sockets);
+    printf("Wrote COS1 schemata:\n%s\n", cos1_schema);
+    printf("Wrote COS2 schemata:\n%s\n", cos2_schema);
 
-    /* 5) Find each VM’s QEMU PID */
+    /* 9) Find each VM’s QEMU PID and append to COS1/tasks & COS2/tasks. */
     pid_t pid1 = find_vm_pid(vm1);
     if (pid1 <= 0) die("Cannot find QEMU PID for VM \"%s\"", vm1);
     pid_t pid2 = find_vm_pid(vm2);
@@ -383,7 +456,6 @@ int main(int argc, char *argv[]) {
     printf("VM1 \"%s\" → PID %d\n", vm1, pid1);
     printf("VM2 \"%s\" → PID %d\n", vm2, pid2);
 
-    /* 6) Append each PID into COS1/tasks and COS2/tasks */
     {
         char buf[32];
         snprintf(buf, sizeof(buf), "%d", pid1);
@@ -397,31 +469,42 @@ int main(int argc, char *argv[]) {
         printf("Appended PID %d to %s\n", pid2, COS2_TASKS);
     }
 
-    /* 7) Initialize PQoS */
-    struct pqos_config cfg = { .interface = PQOS_INTER_OS_RESCTRL_MON };
-    if (pqos_init(&cfg) != PQOS_RETVAL_OK) die("pqos_init failed");
-    if (pqos_mon_reset() != PQOS_RETVAL_OK) die("pqos_mon_reset failed");
-
-    /* 8) Phase 1: monitor half‐cache (socket 1 only, half‐ways) for 'duration' seconds */
-    printf("Phase 1: half‐cache (on socket 1) baseline (duration = %d s)\n", duration);
-    pqos_mon_reset();
+    /* 10) Monitor both for ‘duration’ seconds (optional). */
+    printf("Phase 1: half‐cache monitoring (duration = %d s)\n", duration);
+    /* We do NOT call pqos_mon_reset() again or it would revert to default masks. */
     monitor_pids_pair(pid1, pid2, duration,
                       "VM1_half_baseline.txt",
                       "VM2_half_baseline.txt");
     printf("Phase 1 complete: VM1_half_baseline.txt, VM2_half_baseline.txt\n");
 
-    /* 9) Clean up COS1/COS2, return PIDs to default (full LLC), then re‐initialize PQoS */
+    /*
+     * If you ever want to restore the default CAT masks, you can run:
+     *
+     *   pqos_mon_reset();
+     *   echo "" > /sys/fs/resctrl/COS1/tasks
+     *   echo "" > /sys/fs/resctrl/COS2/tasks
+     *   rmdir /sys/fs/resctrl/COS1
+     *   rmdir /sys/fs/resctrl/COS2
+     *   pqos_fini();
+     *
+     * Until you do that, “cat /sys/fs/resctrl/COS1/schemata” and
+     * “cat /sys/fs/resctrl/COS2/schemata” will continue showing your custom masks.
+     */
+
+        /* -------------------------------------------------------------------------------------------- */
+    /*                            CLEANUP & PHASE 2                         */
+    /*  We do not return tasks to default or remove COS1/COS2 here, so our masks remain.  */       
     pqos_mon_reset();
     {
         char buf[32];
         snprintf(buf, sizeof(buf), "%d", pid1);
-        if (append_str_to_file(DEFAULT_TASKS, buf) != 0)
-            die("Appending %d to %s: %s", pid1, DEFAULT_TASKS, strerror(errno));
+        if (append_str_to_file(COS1_TASKS, buf) != 0)
+            die("Appending %d to %s: %s", pid1, COS1_TASKS, strerror(errno));
         printf("Returned PID %d to default group\n", pid1);
 
         snprintf(buf, sizeof(buf), "%d", pid2);
-        if (append_str_to_file(DEFAULT_TASKS, buf) != 0)
-            die("Appending %d to %s: %s", pid2, DEFAULT_TASKS, strerror(errno));
+        if (append_str_to_file(COS2_TASKS, buf) != 0)
+            die("Appending %d to %s: %s", pid2, COS2_TASKS, strerror(errno));
         printf("Returned PID %d to default group\n", pid2);
     }
     if (rmdir(COS1_DIR) != 0) die("rmdir %s: %s", COS1_DIR, strerror(errno));
@@ -429,18 +512,22 @@ int main(int argc, char *argv[]) {
     printf("Removed COS1 and COS2\n");
 
     pqos_fini();
-    /* Re‐init PQoS for Phase 2 */
     if (pqos_init(&cfg) != PQOS_RETVAL_OK) die("pqos_init (phase 2) failed");
     if (pqos_mon_reset() != PQOS_RETVAL_OK) die("pqos_mon_reset (phase 2) failed");
 
-    /* 10) Phase 2: monitor normal (full‐cache) contention for 'duration' seconds */
     printf("Phase 2: normal (duration = %d s)\n", duration);
-    pqos_mon_reset();
     monitor_pids_pair(pid1, pid2, duration,
                       "VM1_normal.txt",
                       "VM2_normal.txt");
     printf("Phase 2 complete: VM1_normal.txt, VM2_normal.txt\n");
-
     pqos_fini();
+    
+    /* -------------------------------------------------------------------------------------------- */
+
+    /* Exit now. COS1/COS2 + their schemata remain exactly as we wrote them. */
+
+
     return EXIT_SUCCESS;
 }
+
+
