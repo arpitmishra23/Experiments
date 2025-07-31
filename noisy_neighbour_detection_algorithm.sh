@@ -56,7 +56,7 @@ for i in "${!TOP_PIDS[@]}"; do
 done
 
 # --------------------------------------------------
-# 4) For each of our top commands, call pqos per‑PID and aggregate
+# 4) For each of our top commands, call pqos per-PID and aggregate
 # --------------------------------------------------
 AGG=/tmp/noisy_agg.csv
 echo "proc,mis_sum,llc_kb_sum,bw_sum" > "$AGG"
@@ -67,43 +67,46 @@ for idx in "${!TOP_PIDS[@]}"; do
   [[ -z "$pid_line" ]] && continue
 
   echo "[*] PQoS for $proc (PIDs: $pid_line) for ${DUR}s"
+
+  # initialize sums
   mis_sum=0
   llc_kb_sum=0
   bw_sum=0
 
   for pid in $pid_line; do
-    # 4.1) raw misses
-    cnt=$(awk -v P="$pid" '$1==P && $3~/^LLC-load-misses/ {c++}
-                      END{print c+0}' /tmp/llc.events.txt)
-    mis_sum=$((mis_sum + cnt))
+    # inside your for pid in $pid_line loop…
+LOG=$(mktemp)
+sudo pqos -I -p "all:$pid" -t "$DUR" >"$LOG" 2>/dev/null || true
 
-    # 4.2) PQoS for this single PID
-    LOG=$(mktemp)
-    sudo pqos -I -p "all:$pid" -t "$DUR" >"$LOG" 2>/dev/null || true
+# tail the last block and parse cols 4 (MISSES), 5 (LLC[KB]), and 6+7 (BW)
+read miss_val llc_val bw_val < <(
+  tail -n +$(( $(grep -n '^TIME' "$LOG" | tail -1 | cut -d: -f1) + 1 )) "$LOG" \
+    | awk '
+      /^[[:space:]]*[0-9]/ {
+        # strip suffix k/M on MISSES
+        gsub(/k$/,"000",$4)
+        gsub(/m$/,"000000",$4)
+        sum_miss += $4+0
 
-    # sum the last TIME block as integers
-    read llc_val bw_val < <(
-      tail -n +$(( $(grep -n '^TIME' "$LOG" | tail -1 | cut -d: -f1) +1 )) "$LOG" \
-        | awk '
-            /^[[:space:]]*[0-9]/ {
-              sum_llc += $5
-              sum_bw  += ($6 + $7)
-            }
-            END { printf("%d %d\n", sum_llc+0, sum_bw+0) }
-          '
-    )
-    rm -f "$LOG"
+        sum_llc  += $5
+        sum_bw   += ($6 + $7)
+      }
+      END { printf("%d %d %d\n", sum_miss, sum_llc, sum_bw) }
+    '
+)
+rm -f "$LOG"
 
-    llc_kb_sum=$(( llc_kb_sum + llc_val ))
-    bw_sum=$(( bw_sum    + bw_val   ))
+mis_sum=$(( mis_sum     + miss_val ))
+llc_kb_sum=$(( llc_kb_sum  + llc_val ))
+bw_sum=$(( bw_sum      + bw_val  ))
+
   done
 
-  # 4.3) append this process's aggregate metrics
+  # 4.3) append this process's aggregated metrics
   printf "%s,%d,%d,%d\n" \
     "$proc" "$mis_sum" "$llc_kb_sum" "$bw_sum" \
     >> "$AGG"
 done
-
     
 
 # --------------------------------------------------
